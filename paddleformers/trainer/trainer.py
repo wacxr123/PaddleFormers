@@ -451,6 +451,7 @@ class Trainer:
         self.processing_class = processing_class
         self.optimizer, self.lr_scheduler = optimizers
 
+        self.inputsaver = InputSaver()
         self.label_smoother = None
         self.state = TrainerState()
         self.control = TrainerControl()
@@ -2128,6 +2129,27 @@ class Trainer:
                         if self.args.count_trained_tokens:
                             self.trained_effective_tokens += (inputs["input_ids"] != self.args.pad_token_id).sum()
                             self.trained_tokens += inputs["input_ids"].numel()
+
+                    # Save inputs for debugging if enabled
+                    if InputSaver.should_save():
+                        self.inputsaver.save_inputs(inputs, self.state.global_step)
+                    if os.getenv("SKIP_TRAINING", "0").lower() in ("1", "true", "t"):
+                        self.state.global_step += 1
+                        self.state.epoch = epoch + (step + 1) / steps_in_epoch
+                        self.state.consumed_samples = (
+                            self.state.global_step
+                            * args.per_device_train_batch_size
+                            * args.gradient_accumulation_steps
+                            * args.dataset_world_size
+                        )
+                        self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                        if self.control.should_epoch_stop or self.control.should_training_stop:
+                            metrics = speed_metrics(
+                                "train", start_time, num_samples=num_train_samples, num_steps=self.state.max_steps
+                            )
+                            return TrainOutput(self.state.global_step, 0.0, metrics)
+                        else:
+                            continue
 
                     if not self.args.enable_auto_parallel:
                         with sync_context:
