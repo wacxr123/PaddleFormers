@@ -910,6 +910,94 @@ class Qwen3VLPlugin(Qwen2VLPlugin):
 
         return mm_inputs
 
+    def pre_tokenize(self, messages, images, videos, mm_inputs, processor):
+        from paddleformers.transformers import AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "/root/paddlejob/workspace/env_run/chenxuran/models/Qwen3-VL-2B-Instruct", trust_remote_code=True
+        )
+        content = messages[0]["content"]
+        # replace all PLACEHOLDER with self.image_token_id
+        content = content.replace(IMAGE_PLACEHOLDER, self.image_token)
+        content = content.replace(VIDEO_PLACEHOLDER, self.video_token)
+        token_ids = self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(content))
+        # Add an EOS token at the end of each sample
+        token_ids = token_ids + [self.tokenizer.eos_token_id]
+        video_token_id = self.tokenizer.convert_tokens_to_ids(self.video_token)
+        image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_token)
+
+        image_processor = getattr(processor, "image_processor")
+        video_processor = getattr(processor, "video_processor")
+
+        image_merge_length = getattr(image_processor, "merge_size") ** 2
+        video_merge_length = getattr(video_processor, "merge_size") ** 2
+        if self.expand_mm_tokens:
+            image_grid_thw = mm_inputs.get("image_grid_thw", [])
+            video_grid_thw = mm_inputs.get("video_grid_thw", [])
+            num_frames = video_grid_thw[0][0] if len(video_grid_thw) > 0 else 0
+            video_metadata = mm_inputs.get("video_metadata", {})
+
+        else:
+            image_grid_thw = [None] * len(images)
+            video_grid_thw = [None] * len(videos)
+            num_frames = 0
+            timestamps = [0]
+        # while IMAGE_PLACEHOLDER in token_ids:
+        #     if num_image_tokens >= len(image_grid_thw):
+        #         raise ValueError(f"Found more {IMAGE_PLACEHOLDER} tags than actual images provided.")
+
+        #     image_seqlen = (
+        #         image_grid_thw[num_image_tokens].prod().item() // image_merge_length
+        #         if self.expand_mm_tokens
+        #         else 1
+        #     )
+        #     content = content.replace(
+        #         IMAGE_PLACEHOLDER,
+        #         f"{self.vision_bos_token}{self.image_token * image_seqlen}{self.vision_eos_token}",
+        #         1,
+        #     )
+        #     num_image_tokens += 1
+
+        # find all index in tokens that need to be replaced
+        replace_idx_list = [i for i, token in enumerate(token_ids) if token == video_token_id]
+        added_tokens_len = 0
+        labels = [-1] * len(token_ids)
+        for i, idx in enumerate(replace_idx_list):
+            if i >= len(video_grid_thw):
+                raise ValueError(f"Found more {VIDEO_PLACEHOLDER} tags than actual videos provided.")
+
+            metadata = video_metadata[i]
+            # timestamps = metadata.timestamps
+            timestamps = processor._calculate_timestamps(
+                metadata.frames_indices,
+                metadata.fps,
+                video_processor.merge_size,
+            )
+            video_structure = ""
+            for frame_index in range(num_frames):
+                video_seqlen = (
+                    video_grid_thw[i][1:].prod().item() // video_merge_length if self.expand_mm_tokens else 1
+                )
+                timestamp_sec = timestamps[frame_index]
+                frame_structure = (
+                    f"<{timestamp_sec:.1f} seconds>"
+                    f"{self.vision_bos_token}{self.video_token * video_seqlen}{self.vision_eos_token}"
+                )
+                video_structure += frame_structure
+
+            if not self.expand_mm_tokens:
+                video_structure = f"{self.vision_bos_token}{self.video_token}{self.vision_eos_token}"
+            video_structure_ids = self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(video_structure))
+            # Replace video token with video_structure_ids
+            token_len = len(video_structure_ids)
+            token_ids = (
+                token_ids[: idx + added_tokens_len] + video_structure_ids + token_ids[added_tokens_len + idx + 1 :]
+            )
+            labels = labels[: idx + added_tokens_len] + [-100] * token_len + labels[added_tokens_len + idx + 1 :]
+            added_tokens_len += token_len - 1
+
+        return token_ids, labels
+
     @override
     def process_messages(
         self,

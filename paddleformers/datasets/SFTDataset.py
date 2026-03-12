@@ -531,17 +531,27 @@ class SFTDataSet(IterableDataset):
                 messages=messages,
             )
 
-            messages = self.template.mm_plugin.process_messages(
-                messages, images, videos, audios, mm_inputs, self.processor
+            # messages = self.template.mm_plugin.process_messages(
+            #     messages, images, videos, audios, mm_inputs, self.processor
+            # )
+
+            # tokens = self._encode_pretraining_messages(messages, actual_example_num)
+
+            tokens, pre_labels = self.template.mm_plugin.pre_tokenize(
+                messages, images, videos, mm_inputs, self.processor
             )
 
-            tokens = self._encode_pretraining_messages(messages, actual_example_num)
+            if len(tokens) > self.max_seq_len + 1:
+                # Truncate the sequence to the maximum length
+                tokens = tokens[: self.max_seq_len + 1]
+
             if len(tokens) > self.max_seq_len + 1:
                 # Truncate the sequence to the maximum length
                 tokens = tokens[: self.max_seq_len + 1]
 
             labels = self.template.mm_plugin.process_tokens(tokens, self.processor)
-
+            # use non -1 value in pre_labels to cover values in labels
+            labels = [pre_labels[i] if label == -1 else label for i, label in enumerate(labels)]
             # label shift
             labels = labels[1:] + [-100]
 
