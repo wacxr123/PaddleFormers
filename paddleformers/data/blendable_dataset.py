@@ -52,6 +52,7 @@ class BlendableDataset(paddle.io.Dataset):
                 assert (
                     num_datasets < 32767
                 ), f"Detect num_datasets({num_datasets})>=32767. Currently, num_datasets should be less than 32767."
+
                 dataset_index = np.zeros(self.size, dtype=np.int16)
             else:
                 assert (

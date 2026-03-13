@@ -544,10 +544,7 @@ class SFTDataSet(IterableDataset):
             if len(tokens) > self.max_seq_len + 1:
                 # Truncate the sequence to the maximum length
                 tokens = tokens[: self.max_seq_len + 1]
-
-            if len(tokens) > self.max_seq_len + 1:
-                # Truncate the sequence to the maximum length
-                tokens = tokens[: self.max_seq_len + 1]
+                pre_labels = pre_labels[: self.max_seq_len + 1]
 
             labels = self.template.mm_plugin.process_tokens(tokens, self.processor)
             # use non -1 value in pre_labels to cover values in labels
