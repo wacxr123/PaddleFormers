@@ -943,23 +943,18 @@ class Qwen3VLPlugin(Qwen2VLPlugin):
 
         return mm_inputs
 
-    def _replace_mm_tokens(
-        self, token_ids, labels, mm_token_id, mm_grid_thw, vision_structure_builder, mm_name="image"
-    ):
+    def _replace_mm_tokens(self, token_ids, labels, mm_token_id, mm_grid_thw, vision_structure_builder):
         """generic func for img/videos"""
         replace_idx_list = [i for i, token in enumerate(token_ids) if token == mm_token_id]
-        added_tokens_len = 0
+        delta_len = 0
         for i, idx in enumerate(replace_idx_list):
-            if i >= len(mm_grid_thw):
-                raise ValueError(f"Found more {mm_name} tags than actual {mm_name}s provided.")
-
+            # if i >= len(mm_grid_thw):
+            #     mm_name="image" or "video"
+            #     raise ValueError(f"Found more {mm_name} tags than actual {mm_name}s provided.")
             mm_structure_ids = vision_structure_builder(i)
-            token_len = len(mm_structure_ids)
-            token_ids = (
-                token_ids[: idx + added_tokens_len] + mm_structure_ids + token_ids[added_tokens_len + idx + 1 :]
-            )
-            labels = labels[: idx + added_tokens_len] + [-100] * token_len + labels[added_tokens_len + idx + 1 :]
-            added_tokens_len += token_len - 1
+            token_ids = token_ids[: idx + delta_len] + mm_structure_ids + token_ids[idx + delta_len + 1 :]
+            labels = labels[: idx + delta_len] + [-100] * len(mm_structure_ids) + labels[idx + delta_len + 1 :]
+            delta_len += len(mm_structure_ids) - 1
 
         return token_ids, labels
 
@@ -1027,10 +1022,7 @@ class Qwen3VLPlugin(Qwen2VLPlugin):
             labels,
             image_token_id,
             image_grid_thw,
-            image_merge_length,
-            tokenizer,
             build_image_structure,
-            "image",
         )
 
         token_ids, labels = self._replace_mm_tokens(
@@ -1038,10 +1030,7 @@ class Qwen3VLPlugin(Qwen2VLPlugin):
             labels,
             video_token_id,
             video_grid_thw,
-            video_merge_length,
-            tokenizer,
             build_video_structure,
-            "video",
         )
 
         return token_ids, labels
