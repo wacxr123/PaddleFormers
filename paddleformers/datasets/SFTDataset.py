@@ -915,25 +915,30 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
         super().__init__(**dataset_config)
 
         if self.packing:
-            raise ValueError(
-                "[MapSFTDataset] packing=True is not supported for non-streaming (Map) dataset. "
-                "Please use IteratorSFTDataset instead or set packing=False."
-            )
-
-        self.raw_data = list(self.mix_datasets)
-        logger.info(f"[MapSFTDataset] Total samples: {len(self.raw_data)}")
-
-        self.n_try_fetch = min(10, len(self.raw_data))
-        self.random_state = np.random.RandomState(None)
-        self.traceback_limit = 10
-        self._traceback_counter = 0
-        self._idx = 0
-        self._idx_list = self.random_state.permutation(len(self.raw_data)).tolist()
+            self.packed_data = []
+            for batch in self._generate_sequences():
+                if batch:
+                    self.packed_data.append(batch)
+            logger.info(f"[MapSFTDataset] packing=True, total packs: {len(self.packed_data)}")
+        else:
+            self.raw_data = list(self.mix_datasets)
+            logger.info(f"[MapSFTDataset] packing=False, total samples: {len(self.raw_data)}")
+            self.n_try_fetch = min(10, len(self.raw_data))
+            self.random_state = np.random.RandomState(None)
+            self.traceback_limit = 10
+            self._traceback_counter = 0
+            self._idx = 0
+            self._idx_list = self.random_state.permutation(len(self.raw_data)).tolist()
 
     def __len__(self):
+        if self.packing:
+            return len(self.packed_data)
         return len(self.raw_data)
 
     def __getitem__(self, idx):
+        if self.packing:
+            return self.packed_data[idx]
+
         actual_example_num = 1
 
         for i in range(self.n_try_fetch):
