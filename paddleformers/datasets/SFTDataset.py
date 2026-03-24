@@ -914,14 +914,12 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
     def __init__(self, **dataset_config):
         super().__init__(**dataset_config)
 
+        # Always store raw data for index-based access
+        self.raw_data = list(self.mix_datasets)
+
         if self.packing:
-            self.packed_data = []
-            for batch in self._generate_sequences():
-                if batch:
-                    self.packed_data.append(batch)
-            logger.info(f"[MapSFTDataset] packing=True, total packs: {len(self.packed_data)}")
+            self._build_packed_idx()
         else:
-            self.raw_data = list(self.mix_datasets)
             logger.info(f"[MapSFTDataset] packing=False, total samples: {len(self.raw_data)}")
             self.n_try_fetch = min(10, len(self.raw_data))
             self.random_state = np.random.RandomState(None)
@@ -930,14 +928,78 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
             self._idx = 0
             self._idx_list = self.random_state.permutation(len(self.raw_data)).tolist()
 
+    def _build_packed_idx(self):
+        """First pass: tokenize all samples once to get lengths, then binpack into index lists.
+
+        Stores only packed_idx (List[List[int]]) instead of full token tensors,
+        reducing memory from O(N * seq_len tokens) to O(N * seq_len chars).
+        """
+        from tqdm import tqdm
+
+        logger.info("[MapSFTDataset] packing=True, building packed index (lazy storage)...")
+        actual_example_num = 1
+
+        # Collect (raw_data_idx, token_length) for valid samples, skip invalid ones
+        idx_len_pairs = []  # [(raw_idx, token_len), ...]
+        for raw_idx, example in enumerate(tqdm(self.raw_data, desc="[MapSFTDataset] Tokenizing for lengths")):
+            try:
+                if self.is_pretraining:
+                    seq = self._postprocess_pretraining_sequence(example, actual_example_num)
+                else:
+                    seq = self._postprocess_sequence(example, actual_example_num)
+                if seq is not None:
+                    idx_len_pairs.append((raw_idx, len(seq.token_ids)))
+            except Exception as e:
+                logger.warning(f"[MapSFTDataset] Skipping example {raw_idx}: {e}")
+
+        logger.info(f"[MapSFTDataset] Valid samples: {len(idx_len_pairs)} / {len(self.raw_data)}")
+
+        # Binpack using (idx, length) tuples; calculate_matched_group uses weight_pos=1
+        if self.binpacking:
+            accumulated = list(idx_len_pairs)
+            packed_groups, _ = calculate_matched_group(accumulated, self.max_seq_len, is_finished=True)
+            self.packed_idx = [[item[0] for item in group] for group in packed_groups]
+        else:
+            # Greedy sequential packing
+            self.packed_idx = []
+            current_group = []
+            current_len = 0
+            for raw_idx, token_len in idx_len_pairs:
+                if current_len + token_len <= self.max_seq_len:
+                    current_group.append(raw_idx)
+                    current_len += token_len
+                else:
+                    if current_group:
+                        self.packed_idx.append(current_group)
+                    current_group = [raw_idx]
+                    current_len = token_len
+            if current_group:
+                self.packed_idx.append(current_group)
+
+        logger.info(f"[MapSFTDataset] packing=True, total packs: {len(self.packed_idx)}")
+
     def __len__(self):
         if self.packing:
-            return len(self.packed_data)
+            return len(self.packed_idx)
         return len(self.raw_data)
 
     def __getitem__(self, idx):
         if self.packing:
-            return self.packed_data[idx]
+            # Second tokenize: re-process each raw sample in the pack on demand
+            actual_example_num = 1
+            sequences = []
+            for raw_idx in self.packed_idx[idx]:
+                example = self.raw_data[raw_idx]
+                try:
+                    if self.is_pretraining:
+                        seq = self._postprocess_pretraining_sequence(example, actual_example_num)
+                    else:
+                        seq = self._postprocess_sequence(example, actual_example_num)
+                    if seq is not None:
+                        sequences.append(seq)
+                except Exception as e:
+                    logger.warning(f"[MapSFTDataset] __getitem__ skipping raw_idx={raw_idx}: {e}")
+            return sequences
 
         actual_example_num = 1
 
