@@ -213,6 +213,7 @@ from .unified_checkpoint import UnifiedCheckpointHandler
 from .utils import reshard as reshard_util
 from .utils.async_save import AsyncSaver
 from .utils.ckpt_converter import CheckpointConverter
+from .utils.input_saver import InputSaver
 from .utils.offload_optimizer import offload
 from .utils.reshard import SHARDING_STRATEGY_V1, split_opt_state
 from .utils.sharding_io import GroupGetter, to_device
