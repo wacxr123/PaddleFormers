@@ -351,3 +351,102 @@ def calculate_matched_group(sequences, packing_length: int, is_finished: bool = 
     else:
         ret_sequences = []
     return sequences, ret_sequences
+
+
+def pack_by_length(
+    items,
+    max_seq_len,
+    packing_mode="sequential",
+    packing_interval=1000,
+    return_seqs=False,
+):
+    """Group items into packs that fit within max_seq_len.
+
+    Supports three packing strategies:
+    - "binpacking": optimal bin-packing via `calculate_matched_group`
+    - "greedy": greedy best-fit using argmax on remaining capacity
+    - "sequential" (default): left-to-right greedy sequential packing
+
+    Supports two input modes:
+    - Index mode (default): items = [(idx, length), ...], length is pair[1]
+    - Object mode (return_seqs=True): items = [obj, obj, ...], use len(item.token_ids)
+
+    Args:
+        items: List of items to pack. Can be [(idx, length), ...] or [obj, ...].
+        max_seq_len: Maximum total token length per pack.
+        packing_mode: Packing strategy - "sequential", "binpacking", or "greedy".
+        packing_interval: Buffer size for binpacking batching.
+        return_seqs: If False, return indices (pair[0]). If True, return full items.
+
+    Returns:
+        List[List[int]] (return_seqs=False) or List[List[item]] (return_seqs=True):
+        Groups of indices or items, each group fitting within max_seq_len.
+    """
+    if not items:
+        return []
+
+    # Auto-detect get_length based on input mode
+    if return_seqs:
+
+        def get_length(item):
+            return len(item.token_ids) if hasattr(item, "token_ids") else len(item)
+
+    else:
+        get_length = lambda pair: pair[1]
+
+    if packing_mode == "binpacking":
+        packed_groups, _ = calculate_matched_group(items, max_seq_len, is_finished=True)
+        if return_seqs:
+            # Return full items (e.g., Sequence objects)
+            return [[pair[0] for pair in group] for group in packed_groups]
+        else:
+            # Return indices
+            return [[pair[0] for pair in group] for group in packed_groups]
+
+    if packing_mode == "greedy":
+        left_len = np.zeros(len(items)) - 1
+        left_len[0] = max_seq_len
+        packs = [[]]
+        index = 0
+        left_index = 0
+
+        while index < len(items):
+            item = items[index]
+            item_len = get_length(item)
+            max_left_index = left_len.argmax()
+            if item_len <= left_len[max_left_index]:
+                if return_seqs:
+                    packs[max_left_index].append(item)
+                else:
+                    packs[max_left_index].append(item[0])
+                left_len[max_left_index] -= item_len
+                index += 1
+            else:
+                left_index += 1
+                left_len[left_index] = max_seq_len
+                packs.append([])
+        return packs
+
+    # Default: sequential greedy packing
+    packs = []
+    current_group = []
+    current_len = 0
+    for item in items:
+        item_len = get_length(item)
+        if current_len + item_len <= max_seq_len:
+            if return_seqs:
+                current_group.append(item)
+            else:
+                current_group.append(item[0])
+            current_len += item_len
+        else:
+            if current_group:
+                packs.append(current_group)
+            if return_seqs:
+                current_group = [item]
+            else:
+                current_group = [item[0]]
+            current_len = item_len
+    if current_group:
+        packs.append(current_group)
+    return packs
