@@ -23,8 +23,8 @@ import numpy as np
 from paddle.io import Dataset, IterableDataset
 
 from paddleformers.datasets.data_utils import (
-    calculate_matched_group,
     get_worker_sliced_iterator,
+    pack_by_length,
     postprocess_fc_sequence,
     print_debug_info,
 )
@@ -180,8 +180,12 @@ class BaseSFTDataset:
         else:
             self._current_processor_func = self._process_sequence
 
-        # multiprocessing initialization
-        if self.dataset_num_proc > 1:
+        # Deferred multiprocessing initialization (workers spawned on first use)
+        self._workers_started = False
+
+    def _ensure_workers(self):
+        """Lazily spawn worker processes when multiprocessing is first needed."""
+        if self.dataset_num_proc > 1 and not self._workers_started:
             self.prefetch_size = self.dataset_num_proc * 2
             self._in_queue = mp.Queue(maxsize=self.prefetch_size)
             self._out_queue = mp.Queue(maxsize=self.prefetch_size)
@@ -190,6 +194,7 @@ class BaseSFTDataset:
                 worker = mp.Process(target=self._worker_loop, daemon=True)
                 worker.start()
                 self.workers.append(worker)
+            self._workers_started = True
 
     def __len__(self):
         return len(self.mix_datasets)
@@ -236,6 +241,7 @@ class BaseSFTDataset:
 
         if self.dataset_num_proc > 1:
             # Multiprocessing mode
+            self._ensure_workers()
             if self.mem_debug:
                 print(f"[MemDebug] workers started, RSS={_rss_mb():.0f} MB, " f"num_proc={self.dataset_num_proc}")
             try:
@@ -321,38 +327,44 @@ class BaseSFTDataset:
         else:
             return self._postprocess_sequence(example, actual_example_num)
 
+    def _process_sequence_length(self, example, actual_example_num):
+        """Process a single example and return only its token length.
+
+        Used by MapSFTDataset._build_packed_idx to reduce IPC overhead
+        when multiprocessing — transfers an int instead of a full Sequence.
+        """
+        seq = self._process_sequence(example, actual_example_num)
+        return len(seq.token_ids) if seq is not None else None  # token_ids?
+
+    def _get_packing_mode(self) -> str:
+        """Determine packing mode string from dataset config."""
+        if self.binpacking:
+            return "binpacking"
+        elif self.greedy_intokens:
+            return "greedy"
+        return "sequential"
+
+    def _pack_items(self, items, return_seqs=False):
+        """Unified packing logic using pack_by_length.
+
+        Args:
+            items: List of items to pack. Can be [(idx, length), ...] or [Sequence, ...].
+            return_seqs: If True, return full items. If False, return indices.
+
+        Returns:
+            List of packed groups.
+        """
+        return pack_by_length(
+            items=items,
+            max_seq_len=self.max_seq_len,
+            packing_mode=self._get_packing_mode(),
+            packing_interval=self.packing_interval,
+            return_seqs=return_seqs,
+        )
+
     def _process_pretraining_tokens(self, example, actual_example_num):
         """Process a pretraining example into tokens."""
         return self._encode_pretraining_messages(example["messages"], actual_example_num)
-
-    def _generate_greedy_packs_from_sequences(self, sequences):
-        """Generate packed sequences using greedy strategy from pre-processed sequences.
-
-        Args:
-            sequences: List of pre-processed Sequence objects.
-
-        Returns:
-            list: List of packed sequences.
-        """
-        left_len = np.zeros([len(sequences)]) - 1
-        left_len[0] = self.max_seq_len
-        generate_packs = [[]]
-        index = 0
-        left_index = 0
-
-        while index < len(sequences):
-            sequence = sequences[index]
-            max_left_index = left_len.argmax()
-            if len(sequence.token_ids) <= left_len[max_left_index]:
-                generate_packs[max_left_index].append(sequence)
-                left_len[max_left_index] -= len(sequence.token_ids)
-                index += 1
-            else:
-                left_index += 1
-                left_len[left_index] = self.max_seq_len
-                generate_packs.append([])
-
-        return generate_packs
 
     def _generate_sequences(self):
 
@@ -472,24 +484,32 @@ class BaseSFTDataset:
                     accumulated_data = []
 
                     while True:
-                        batch_data, num_samples = self._binpacking_process_batch(data_iter, self.packing_interval)
-                        finished = num_samples != self.packing_interval
+                        # Collect batch of sequences
+                        batch_sequences = []
+                        for _ in range(self.packing_interval):
+                            try:
+                                seq = next(data_iter)
+                                if self.estimate:
+                                    self.used_samples += 1
+                                if seq:
+                                    batch_sequences.append(seq)
+                            except StopIteration:
+                                break
 
-                        accumulated_data += batch_data
+                        finished = len(batch_sequences) < self.packing_interval
+                        accumulated_data += batch_sequences
 
-                        sequences, accumulated_data = calculate_matched_group(
-                            accumulated_data, self.max_seq_len, is_finished=finished
-                        )
+                        # Use unified _pack_items
+                        packed = self._pack_items(accumulated_data, return_seqs=True)
 
-                        for row in sequences:
-                            yield [r[0] for r in row]
+                        for pack in packed:
+                            if len(pack) > 0:
+                                yield pack
 
                         if self.estimate:
-                            self.used_estimate_samples += num_samples
+                            self.used_estimate_samples += len(batch_sequences)
                             self.print_max_steps_estimate_progress()
-                            # Stop estimation if the number of samples used in estimation is larger than max_estimate_samples
                             if self.used_estimate_samples >= self.max_estimate_samples:
-                                # Set flag to False and yield empty list to signal the end of estimation
                                 self.estimate = False
                                 yield []
 
@@ -541,8 +561,8 @@ class BaseSFTDataset:
                         sequences_buffer.append(sequence)
 
                         if len(sequences_buffer) >= buffer_size:
-                            # Running greedy strategy in sequences_buffer.
-                            generate_packs = self._generate_greedy_packs_from_sequences(sequences_buffer)
+                            # Use unified _pack_items
+                            generate_packs = self._pack_items(sequences_buffer, return_seqs=True)
                             for pack in generate_packs:
                                 if len(pack) > 0:
                                     yield pack
@@ -555,7 +575,7 @@ class BaseSFTDataset:
                             if self.used_estimate_samples >= self.max_estimate_samples:
                                 # Yield left packs before estimation ends
                                 if len(sequences_buffer) > 0:
-                                    generate_packs = self._generate_greedy_packs_from_sequences(sequences_buffer)
+                                    generate_packs = self._pack_items(sequences_buffer, return_seqs=True)
                                     for pack in generate_packs:
                                         if len(pack) > 0:
                                             yield pack
@@ -564,7 +584,7 @@ class BaseSFTDataset:
                                 yield []
 
                     if len(sequences_buffer) > 0:
-                        generate_packs = self._generate_greedy_packs_from_sequences(sequences_buffer)
+                        generate_packs = self._pack_items(sequences_buffer, return_seqs=True)
                         for pack in generate_packs:
                             if len(pack) > 0:
                                 yield pack
@@ -882,21 +902,6 @@ class BaseSFTDataset:
                 if length >= suffix_len and input_ids[start : start + suffix_len] == suffix_tokens_id:
                     labels[start : start + suffix_len] = suffix_tokens_id
 
-    def _binpacking_process_batch(self, iterator, batch_size):
-        batch = []
-        count = 0
-        for _ in range(batch_size):
-            try:
-                encoded = next(iterator)
-                if self.estimate:
-                    self.used_samples += 1
-                if encoded:
-                    batch.append((encoded, len(encoded.token_ids)))
-                count += 1
-            except StopIteration:
-                break
-        return batch, count
-
 
 class IteratorSFTDataset(BaseSFTDataset, IterableDataset):
     def __init__(self, **dataset_config):
@@ -918,6 +923,8 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
         self.raw_data = list(self.mix_datasets)
 
         if self.packing:
+            # Use lightweight length-only processor for packing index building
+            self._current_processor_func = self._process_sequence_length
             self._build_packed_idx()
         else:
             logger.info(f"[MapSFTDataset] packing=False, total samples: {len(self.raw_data)}")
@@ -929,7 +936,11 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
             self._idx_list = self.random_state.permutation(len(self.raw_data)).tolist()
 
     def _build_packed_idx(self):
-        """First pass: tokenize all samples once to get lengths, then binpack into index lists.
+        """First pass: tokenize all samples once to get lengths, then pack into index lists.
+
+        Supports multiprocessing via dataset_num_proc for the tokenization pass.
+        Uses pack_by_length for grouping, supporting binpacking, greedy_intokens,
+        and sequential packing strategies.
 
         Stores only packed_idx (List[List[int]]) instead of full token tensors,
         reducing memory from O(N * seq_len tokens) to O(N * seq_len chars).
@@ -941,40 +952,55 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
 
         # Collect (raw_data_idx, token_length) for valid samples, skip invalid ones
         idx_len_pairs = []  # [(raw_idx, token_len), ...]
-        for raw_idx, example in enumerate(tqdm(self.raw_data, desc="[MapSFTDataset] Tokenizing for lengths")):
-            try:
-                if self.is_pretraining:
-                    seq = self._postprocess_pretraining_sequence(example, actual_example_num)
-                else:
-                    seq = self._postprocess_sequence(example, actual_example_num)
-                if seq is not None:
-                    idx_len_pairs.append((raw_idx, len(seq.token_ids)))
-            except Exception as e:
-                logger.warning(f"[MapSFTDataset] Skipping example {raw_idx}: {e}")
+
+        if self.dataset_num_proc > 1:
+            # Multiprocessing path: reuse existing worker pool infrastructure
+            self._ensure_workers()
+            pending, send_idx, recv_idx = 0, 0, 0
+            result_buffer = {}
+            total = len(self.raw_data)
+
+            # Pre-fill the queue
+            for _ in range(min(self.prefetch_size, total)):
+                self._in_queue.put((send_idx, self.raw_data[send_idx], actual_example_num))
+                send_idx += 1
+                pending += 1
+
+            with tqdm(total=total, desc="[MapSFTDataset] Tokenizing for lengths") as pbar:
+                while pending > 0:
+                    idx, result = self._out_queue.get()
+                    pending -= 1
+                    pbar.update(1)
+
+                    # Refill the queue
+                    while send_idx < total and pending < self.prefetch_size:
+                        self._in_queue.put((send_idx, self.raw_data[send_idx], actual_example_num))
+                        send_idx += 1
+                        pending += 1
+
+                    # Buffer results for in-order processing
+                    result_buffer[idx] = result
+
+                    # Yield results in order
+                    while recv_idx in result_buffer:
+                        res = result_buffer.pop(recv_idx)
+                        if res is not None:
+                            idx_len_pairs.append((recv_idx, res))
+                        recv_idx += 1
+        else:
+            # Single-threaded path
+            for raw_idx, example in enumerate(tqdm(self.raw_data, desc="[MapSFTDataset] Tokenizing for lengths")):
+                try:
+                    length = self._process_sequence_length(example, actual_example_num)
+                    if length is not None:
+                        idx_len_pairs.append((raw_idx, length))
+                except Exception as e:
+                    logger.warning(f"[MapSFTDataset] Skipping example {raw_idx}: {e}")
 
         logger.info(f"[MapSFTDataset] Valid samples: {len(idx_len_pairs)} / {len(self.raw_data)}")
 
-        # Binpack using (idx, length) tuples; calculate_matched_group uses weight_pos=1
-        if self.binpacking:
-            accumulated = list(idx_len_pairs)
-            packed_groups, _ = calculate_matched_group(accumulated, self.max_seq_len, is_finished=True)
-            self.packed_idx = [[item[0] for item in group] for group in packed_groups]
-        else:
-            # Greedy sequential packing
-            self.packed_idx = []
-            current_group = []
-            current_len = 0
-            for raw_idx, token_len in idx_len_pairs:
-                if current_len + token_len <= self.max_seq_len:
-                    current_group.append(raw_idx)
-                    current_len += token_len
-                else:
-                    if current_group:
-                        self.packed_idx.append(current_group)
-                    current_group = [raw_idx]
-                    current_len = token_len
-            if current_group:
-                self.packed_idx.append(current_group)
+        # Use unified _pack_items
+        self.packed_idx = self._pack_items(idx_len_pairs, return_seqs=False)
 
         logger.info(f"[MapSFTDataset] packing=True, total packs: {len(self.packed_idx)}")
 
@@ -991,10 +1017,7 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
             for raw_idx in self.packed_idx[idx]:
                 example = self.raw_data[raw_idx]
                 try:
-                    if self.is_pretraining:
-                        seq = self._postprocess_pretraining_sequence(example, actual_example_num)
-                    else:
-                        seq = self._postprocess_sequence(example, actual_example_num)
+                    seq = self._process_sequence(example, actual_example_num)
                     if seq is not None:
                         sequences.append(seq)
                 except Exception as e:
@@ -1012,10 +1035,7 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
 
             example = self.raw_data[current_idx]
             try:
-                if self.is_pretraining:
-                    sequence = self._postprocess_pretraining_sequence(example, actual_example_num)
-                else:
-                    sequence = self._postprocess_sequence(example, actual_example_num)
+                sequence = self._process_sequence(example, actual_example_num)
 
                 if sequence is not None:
                     return [sequence]
