@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
+import hashlib
+import json
 import multiprocessing as mp
 import os
 import time
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 from paddle.io import Dataset, IterableDataset
@@ -334,7 +337,7 @@ class BaseSFTDataset:
         when multiprocessing — transfers an int instead of a full Sequence.
         """
         seq = self._process_sequence(example, actual_example_num)
-        return len(seq.token_ids) if seq is not None else None  # token_ids?
+        return len(seq.token_ids) if seq is not None else None
 
     def _get_packing_mode(self) -> str:
         """Determine packing mode string from dataset config."""
@@ -915,9 +918,31 @@ class IteratorSFTDataset(BaseSFTDataset, IterableDataset):
                 yield from self._generate_sequences()
 
 
+def _serialize_packed_idx(packed_idx: List[List[int]]):
+    """Serialize packed_idx to CSR format (data + offsets arrays)."""
+    offsets = np.zeros(len(packed_idx) + 1, dtype=np.int32)
+    for i, pack in enumerate(packed_idx):
+        offsets[i + 1] = offsets[i] + len(pack)
+    data = np.empty(int(offsets[-1]), dtype=np.int32)
+    pos = 0
+    for pack in packed_idx:
+        n = len(pack)
+        data[pos : pos + n] = pack
+        pos += n
+    return data, offsets
+
+
+def _deserialize_packed_idx(data, offsets) -> List[List[int]]:
+    """Reconstruct packed_idx from CSR format arrays."""
+    return [data[offsets[i] : offsets[i + 1]].tolist() for i in range(len(offsets) - 1)]
+
+
 class MapSFTDataset(BaseSFTDataset, Dataset):
     def __init__(self, **dataset_config):
         super().__init__(**dataset_config)
+
+        self._dataset_config = dataset_config  # preserved for cache key / mtime computation
+        self.packed_idx_cache_dir: Optional[str] = dataset_config.get("packed_idx_cache_dir", None)
 
         # Always store raw data for index-based access
         self.raw_data = list(self.mix_datasets)
@@ -946,6 +971,13 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
         reducing memory from O(N * seq_len tokens) to O(N * seq_len chars).
         """
         from tqdm import tqdm
+
+        # Try loading from cache first
+        if self.packed_idx_cache_dir is not None:
+            cached = self._load_packed_idx_cache()
+            if cached is not None:
+                self.packed_idx = cached
+                return
 
         logger.info("[MapSFTDataset] packing=True, building packed index (lazy storage)...")
         actual_example_num = 1
@@ -1003,6 +1035,130 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
         self.packed_idx = self._pack_items(idx_len_pairs, return_seqs=False)
 
         logger.info(f"[MapSFTDataset] packing=True, total packs: {len(self.packed_idx)}")
+
+        # Save cache after successful build
+        if self.packed_idx_cache_dir is not None:
+            self._save_packed_idx_cache()
+
+    def _compute_cache_key(self) -> str:
+        """Compute a 16-char SHA-256 digest of all parameters that affect packed_idx."""
+        cfg = self._dataset_config
+        tokenizer_id = getattr(self.tokenizer, "name_or_path", None) or type(self.tokenizer).__name__
+        template_id = type(self.template).__name__ if self.template else "NoTemplate"
+        key_dict = {
+            "split": str(cfg.get("split", "")),
+            "task_group": str(cfg.get("task_group", "")),
+            "task_group_prob": str(cfg.get("task_group_prob", "")),
+            "sub_dataset_type": str(cfg.get("sub_dataset_type", "")),
+            "random_seed": str(cfg.get("random_seed", 0)),
+            "random_shuffle": str(cfg.get("random_shuffle", True)),
+            "num_samples_each_epoch": str(cfg.get("num_samples_each_epoch", 0)),
+            "max_seq_len": str(self.max_seq_len),
+            "tokenizer": tokenizer_id,
+            "template": template_id,
+            "template_backend": self.template_backend,
+            "use_template": str(self.use_template),
+            "split_multi_turn": str(self.split_multi_turn),
+            "encode_one_turn": str(self.encode_one_turn),
+            "is_pretraining": str(self.is_pretraining),
+            "binpacking": str(self.binpacking),
+            "greedy_intokens": str(self.greedy_intokens),
+            "packing_interval": str(self.packing_interval),
+        }
+        key_str = json.dumps(key_dict, sort_keys=True, ensure_ascii=True)
+        return hashlib.sha256(key_str.encode("utf-8")).hexdigest()[:16]
+
+    def _collect_file_mtimes(self) -> dict:
+        """Collect mtime for every data file listed in task_group."""
+        task_group = str(self._dataset_config.get("task_group", ""))
+        mtimes = {}
+        for raw_path in task_group.split(","):
+            path = raw_path.strip().split("#")[0]  # strip #N_samples suffix
+            if not path:
+                continue
+            if os.path.isdir(path):
+                for root, _, files in os.walk(path):
+                    for fname in sorted(files):
+                        fpath = os.path.join(root, fname)
+                        try:
+                            mtimes[fpath] = os.path.getmtime(fpath)
+                        except OSError:
+                            mtimes[fpath] = -1.0
+            elif os.path.isfile(path):
+                try:
+                    mtimes[path] = os.path.getmtime(path)
+                except OSError:
+                    mtimes[path] = -1.0
+        return mtimes
+
+    def _save_packed_idx_cache(self) -> None:
+        """Serialize packed_idx to .npz and write .meta.json atomically."""
+        cache_key = self._compute_cache_key()
+        data_path = os.path.join(self.packed_idx_cache_dir, f"packed_idx_{cache_key}")
+        meta_path = os.path.join(self.packed_idx_cache_dir, f"packed_idx_{cache_key}.meta.json")
+
+        try:
+            os.makedirs(self.packed_idx_cache_dir, exist_ok=True)
+
+            data_arr, offsets_arr = _serialize_packed_idx(self.packed_idx)
+            np.savez_compressed(data_path, data=data_arr, offsets=offsets_arr)
+
+            meta = {
+                "hash": cache_key,
+                "created_at": datetime.datetime.now().astimezone().isoformat(),
+                "file_mtimes": self._collect_file_mtimes(),
+                "num_packs": len(self.packed_idx),
+                "num_samples": sum(len(p) for p in self.packed_idx),
+                "max_seq_len": self.max_seq_len,
+                "packing_mode": self._get_packing_mode(),
+            }
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+
+            logger.info(f"[MapSFTDataset] Saved packed_idx cache to {data_path}")
+        except Exception as e:
+            logger.warning(f"[MapSFTDataset] Failed to save packed_idx cache: {e}")
+            for p in [data_path, meta_path]:
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+
+    def _load_packed_idx_cache(self) -> Optional[List[List[int]]]:
+        """Try to load packed_idx from cache. Returns None on any miss or error (silent fallback)."""
+        cache_key = self._compute_cache_key()
+        data_path = os.path.join(self.packed_idx_cache_dir, f"packed_idx_{cache_key}.npz")
+        meta_path = os.path.join(self.packed_idx_cache_dir, f"packed_idx_{cache_key}.meta.json")
+
+        if not os.path.exists(data_path) or not os.path.exists(meta_path):
+            logger.info("[MapSFTDataset] packed_idx cache not found, will build from scratch.")
+            return None
+
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+
+            if meta.get("hash") != cache_key:
+                logger.warning("[MapSFTDataset] Cache hash mismatch, ignoring cache.")
+                return None
+
+            current_mtimes = self._collect_file_mtimes()
+            cached_mtimes = meta.get("file_mtimes", {})
+            if current_mtimes != cached_mtimes:
+                logger.warning("[MapSFTDataset] Data file mtime changed since cache was built, ignoring cache.")
+                return None
+
+            npz = np.load(data_path)
+            packed_idx = _deserialize_packed_idx(npz["data"], npz["offsets"])
+            logger.info(
+                f"[MapSFTDataset] Loaded packed_idx cache from {data_path}, "
+                f"skip building... ({len(packed_idx)} packs)"
+            )
+            return packed_idx
+        except Exception as e:
+            logger.warning(f"[MapSFTDataset] Failed to load packed_idx cache (will rebuild): {e}")
+            return None
 
     def __len__(self):
         if self.packing:
