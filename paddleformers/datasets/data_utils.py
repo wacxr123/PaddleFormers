@@ -357,7 +357,7 @@ def pack_by_length(
     items,
     max_seq_len,
     packing_mode="sequential",
-    packing_interval=1000,
+    is_finished=True,
     return_seqs=False,
 ):
     """Group items into packs that fit within max_seq_len.
@@ -375,7 +375,6 @@ def pack_by_length(
         items: List of items to pack. Can be [(idx, length), ...] or [obj, ...].
         max_seq_len: Maximum total token length per pack.
         packing_mode: Packing strategy - "sequential", "binpacking", or "greedy".
-        packing_interval: Buffer size for binpacking batching.
         return_seqs: If False, return indices (pair[0]). If True, return full items.
 
     Returns:
@@ -396,10 +395,10 @@ def pack_by_length(
 
     if packing_mode == "binpacking":
         logger.info("Using binpacking mode for data iteration.")
-        packed_groups, _ = calculate_matched_group(items, max_seq_len, is_finished=True)
+        packed_groups, accumulated_data = calculate_matched_group(items, max_seq_len, is_finished=is_finished)
         if return_seqs:
             # Return full items (e.g., Sequence objects)
-            return [[pair[0] for pair in group] for group in packed_groups]
+            return [[pair[0] for pair in group] for group in packed_groups], accumulated_data
         else:
             # Return indices
             return [[pair[0] for pair in group] for group in packed_groups]

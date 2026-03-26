@@ -588,7 +588,6 @@ def run_sft(
             eval_dataset = create_indexed_dataset(data_file_prefix=eval_file_path)
     else:
         if training_args.should_load_dataset:
-            # add a train/eval teller in dataset_config
             dataset_config["split"] = "train"
             train_dataset = create_dataset_sft(
                 task_group=data_args.train_dataset_path,
@@ -663,12 +662,14 @@ def run_sft(
                 training_args.max_steps = estimate_training(train_dataset, data_args, training_args, model_args)
                 del train_dataset
                 gc.collect()
+                dataset_config["split"] = "train"
                 train_dataset = create_dataset_sft(
                     task_group=data_args.train_dataset_path,
                     task_group_prob=data_args.train_dataset_prob,
                     sub_dataset_type=data_args.train_dataset_type,
                     **dataset_config,
                 )
+                dataset_config.pop("split")
             else:
                 training_args.max_steps = math.ceil(len(train_dataset) / training_args.global_batch_size)
                 training_args.max_steps *= training_args.num_train_epochs
