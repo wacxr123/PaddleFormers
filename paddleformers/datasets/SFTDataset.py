@@ -330,6 +330,10 @@ class BaseSFTDataset:
         else:
             return self._postprocess_sequence(example, actual_example_num)
 
+    def _process_pretraining_tokens(self, example, actual_example_num):
+        """Process a pretraining example into tokens."""
+        return self._encode_pretraining_messages(example["messages"], actual_example_num)
+
     def _process_sequence_length(self, example, actual_example_num):
         """Process a single example and return only its token length.
 
@@ -348,15 +352,7 @@ class BaseSFTDataset:
         return "sequential"
 
     def _pack_items(self, items, return_seqs=False):
-        """Unified packing logic using pack_by_length.
-
-        Args:
-            items: List of items to pack. Can be [(idx, length), ...] or [Sequence, ...].
-            return_seqs: If True, return full items. If False, return indices.
-
-        Returns:
-            List of packed groups.
-        """
+        """Unified packing logic using pack_by_length."""
         return pack_by_length(
             items=items,
             max_seq_len=self.max_seq_len,
@@ -364,10 +360,6 @@ class BaseSFTDataset:
             packing_interval=self.packing_interval,
             return_seqs=return_seqs,
         )
-
-    def _process_pretraining_tokens(self, example, actual_example_num):
-        """Process a pretraining example into tokens."""
-        return self._encode_pretraining_messages(example["messages"], actual_example_num)
 
     def _generate_sequences(self):
 
@@ -457,7 +449,6 @@ class BaseSFTDataset:
         else:
             if not self.packing:
                 logger.info("Not using packing mode for data iteration.")
-                # No packing mode
                 data_iter = self._get_processed_data_iterator(
                     dataset_iterator, actual_example_num, self._process_sequence
                 )
@@ -478,7 +469,7 @@ class BaseSFTDataset:
                 if len(batch_sequence) > 0:
                     yield batch_sequence
                 self.iter_all_examples = True
-            else:
+            elif self.packing:
                 if self.binpacking:
                     logger.info("Using binpacking mode for data iteration.")
                     data_iter = self._get_processed_data_iterator(
@@ -495,7 +486,7 @@ class BaseSFTDataset:
                                 if self.estimate:
                                     self.used_samples += 1
                                 if seq:
-                                    batch_sequences.append(seq)
+                                    batch_sequences.append((seq, len(seq.token_ids)))
                             except StopIteration:
                                 break
 
@@ -512,44 +503,16 @@ class BaseSFTDataset:
                         if self.estimate:
                             self.used_estimate_samples += len(batch_sequences)
                             self.print_max_steps_estimate_progress()
+                            # Stop estimation if the number of samples used in estimation is larger than max_estimate_samples
                             if self.used_estimate_samples >= self.max_estimate_samples:
+                                # Set flag to False and yield empty list to signal the end of estimation
                                 self.estimate = False
                                 yield []
 
                         if finished:
                             self.iter_all_examples = True
                             break
-                elif not self.greedy_intokens:
-                    logger.info("Using base packing mode for data iteration.")
-                    # base packing mode
-                    data_iter = self._get_processed_data_iterator(
-                        dataset_iterator, actual_example_num, self._process_sequence
-                    )
-                    for sequence in data_iter:
-                        if self.estimate:
-                            self.used_samples += actual_example_num
-                        if cur_len + len(sequence.token_ids) <= self.max_seq_len:
-                            batch_sequence.append(sequence)
-                            cur_len += len(sequence.token_ids)
-                        else:
-                            yield batch_sequence
-                            batch_sequence, cur_len = [sequence], len(sequence.token_ids)
-
-                        if self.estimate:
-                            self.used_estimate_samples += actual_example_num
-                            self.print_max_steps_estimate_progress()
-                            if self.used_estimate_samples >= self.max_estimate_samples:
-                                # Yield left batch sequence before estimation ends
-                                if len(batch_sequence) > 0:
-                                    yield batch_sequence
-                                self.used_estimate_samples = 0
-                                # Set flag to False and yield empty list to signal the end of estimation
-                                self.estimate = False
-                                yield []
-                    if len(batch_sequence) > 0:
-                        yield batch_sequence
-                    self.iter_all_examples = True
-                else:
+                elif self.greedy_intokens:
                     logger.info("Using greedy packing mode for data iteration.")
                     # Pseudo multiple rounds + group greedy intokens.
                     buffer_size = self.packing_interval
@@ -592,6 +555,36 @@ class BaseSFTDataset:
                             if len(pack) > 0:
                                 yield pack
 
+                    self.iter_all_examples = True
+                else:
+                    logger.info("Using base packing mode for data iteration.")
+                    # base packing mode
+                    data_iter = self._get_processed_data_iterator(
+                        dataset_iterator, actual_example_num, self._process_sequence
+                    )
+                    for sequence in data_iter:
+                        if self.estimate:
+                            self.used_samples += actual_example_num
+                        if cur_len + len(sequence.token_ids) <= self.max_seq_len:
+                            batch_sequence.append(sequence)
+                            cur_len += len(sequence.token_ids)
+                        else:
+                            yield batch_sequence
+                            batch_sequence, cur_len = [sequence], len(sequence.token_ids)
+
+                        if self.estimate:
+                            self.used_estimate_samples += actual_example_num
+                            self.print_max_steps_estimate_progress()
+                            if self.used_estimate_samples >= self.max_estimate_samples:
+                                # Yield left batch sequence before estimation ends
+                                if len(batch_sequence) > 0:
+                                    yield batch_sequence
+                                self.used_estimate_samples = 0
+                                # Set flag to False and yield empty list to signal the end of estimation
+                                self.estimate = False
+                                yield []
+                    if len(batch_sequence) > 0:
+                        yield batch_sequence
                     self.iter_all_examples = True
 
     def __iter__(self):
@@ -918,37 +911,37 @@ class IteratorSFTDataset(BaseSFTDataset, IterableDataset):
                 yield from self._generate_sequences()
 
 
-def _serialize_packed_idx(packed_idx: List[List[int]]):
-    """Serialize packed_idx to CSR format (data + offsets arrays)."""
-    offsets = np.zeros(len(packed_idx) + 1, dtype=np.int32)
-    for i, pack in enumerate(packed_idx):
-        offsets[i + 1] = offsets[i] + len(pack)
-    data = np.empty(int(offsets[-1]), dtype=np.int32)
-    pos = 0
-    for pack in packed_idx:
-        n = len(pack)
-        data[pos : pos + n] = pack
-        pos += n
-    return data, offsets
-
-
-def _deserialize_packed_idx(data, offsets) -> List[List[int]]:
-    """Reconstruct packed_idx from CSR format arrays."""
-    return [data[offsets[i] : offsets[i + 1]].tolist() for i in range(len(offsets) - 1)]
-
-
 class MapSFTDataset(BaseSFTDataset, Dataset):
+    @staticmethod
+    def _serialize_packed_idx(packed_idx: List[List[int]]):
+        """Serialize packed_idx to CSR format (data + offsets arrays)."""
+        offsets = np.zeros(len(packed_idx) + 1, dtype=np.int32)
+        for i, pack in enumerate(packed_idx):
+            offsets[i + 1] = offsets[i] + len(pack)
+        data = np.empty(int(offsets[-1]), dtype=np.int32)
+        pos = 0
+        for pack in packed_idx:
+            n = len(pack)
+            data[pos : pos + n] = pack
+            pos += n
+        return data, offsets
+
+    @staticmethod
+    def _deserialize_packed_idx(data, offsets) -> List[List[int]]:
+        """Reconstruct packed_idx from CSR format arrays."""
+        return [data[offsets[i] : offsets[i + 1]].tolist() for i in range(len(offsets) - 1)]
+
     def __init__(self, **dataset_config):
         super().__init__(**dataset_config)
 
-        self._dataset_config = dataset_config  # preserved for cache key / mtime computation
+        self._dataset_config = dataset_config  # preserved for cache key
         self.packed_idx_cache_dir: Optional[str] = dataset_config.get("packed_idx_cache_dir", None)
 
         # Always store raw data for index-based access
         self.raw_data = list(self.mix_datasets)
 
         if self.packing:
-            # Use lightweight length-only processor for packing index building
+            # Use length-only processor for packing index building
             self._current_processor_func = self._process_sequence_length
             self._build_packed_idx()
         else:
@@ -1068,29 +1061,6 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
         key_str = json.dumps(key_dict, sort_keys=True, ensure_ascii=True)
         return hashlib.sha256(key_str.encode("utf-8")).hexdigest()[:16]
 
-    def _collect_file_mtimes(self) -> dict:
-        """Collect mtime for every data file listed in task_group."""
-        task_group = str(self._dataset_config.get("task_group", ""))
-        mtimes = {}
-        for raw_path in task_group.split(","):
-            path = raw_path.strip().split("#")[0]  # strip #N_samples suffix
-            if not path:
-                continue
-            if os.path.isdir(path):
-                for root, _, files in os.walk(path):
-                    for fname in sorted(files):
-                        fpath = os.path.join(root, fname)
-                        try:
-                            mtimes[fpath] = os.path.getmtime(fpath)
-                        except OSError:
-                            mtimes[fpath] = -1.0
-            elif os.path.isfile(path):
-                try:
-                    mtimes[path] = os.path.getmtime(path)
-                except OSError:
-                    mtimes[path] = -1.0
-        return mtimes
-
     def _save_packed_idx_cache(self) -> None:
         """Serialize packed_idx to .npz and write .meta.json atomically."""
         cache_key = self._compute_cache_key()
@@ -1100,13 +1070,12 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
         try:
             os.makedirs(self.packed_idx_cache_dir, exist_ok=True)
 
-            data_arr, offsets_arr = _serialize_packed_idx(self.packed_idx)
+            data_arr, offsets_arr = self._serialize_packed_idx(self.packed_idx)
             np.savez_compressed(data_path, data=data_arr, offsets=offsets_arr)
 
             meta = {
                 "hash": cache_key,
                 "created_at": datetime.datetime.now().astimezone().isoformat(),
-                "file_mtimes": self._collect_file_mtimes(),
                 "num_packs": len(self.packed_idx),
                 "num_samples": sum(len(p) for p in self.packed_idx),
                 "max_seq_len": self.max_seq_len,
@@ -1143,14 +1112,8 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
                 logger.warning("[MapSFTDataset] Cache hash mismatch, ignoring cache.")
                 return None
 
-            current_mtimes = self._collect_file_mtimes()
-            cached_mtimes = meta.get("file_mtimes", {})
-            if current_mtimes != cached_mtimes:
-                logger.warning("[MapSFTDataset] Data file mtime changed since cache was built, ignoring cache.")
-                return None
-
             npz = np.load(data_path)
-            packed_idx = _deserialize_packed_idx(npz["data"], npz["offsets"])
+            packed_idx = self._deserialize_packed_idx(npz["data"], npz["offsets"])
             logger.info(
                 f"[MapSFTDataset] Loaded packed_idx cache from {data_path}, "
                 f"skip building... ({len(packed_idx)} packs)"
