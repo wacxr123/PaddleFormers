@@ -395,6 +395,7 @@ def pack_by_length(
         get_length = lambda pair: pair[1]
 
     if packing_mode == "binpacking":
+        logger.info("Using binpacking mode for data iteration.")
         packed_groups, _ = calculate_matched_group(items, max_seq_len, is_finished=True)
         if return_seqs:
             # Return full items (e.g., Sequence objects)
@@ -403,7 +404,8 @@ def pack_by_length(
             # Return indices
             return [[pair[0] for pair in group] for group in packed_groups]
 
-    if packing_mode == "greedy":
+    elif packing_mode == "greedy":
+        logger.info("Using greedy packing mode for data iteration.")
         left_len = np.zeros(len(items)) - 1
         left_len[0] = max_seq_len
         packs = [[]]
@@ -428,25 +430,27 @@ def pack_by_length(
         return packs
 
     # Default: sequential greedy packing
-    packs = []
-    current_group = []
-    current_len = 0
-    for item in items:
-        item_len = get_length(item)
-        if current_len + item_len <= max_seq_len:
-            if return_seqs:
-                current_group.append(item)
+    else:
+        logger.info("Using sequential packing mode for data iteration.")
+        packs = []
+        current_group = []
+        current_len = 0
+        for item in items:
+            item_len = get_length(item)
+            if current_len + item_len <= max_seq_len:
+                if return_seqs:
+                    current_group.append(item)
+                else:
+                    current_group.append(item[0])
+                current_len += item_len
             else:
-                current_group.append(item[0])
-            current_len += item_len
-        else:
-            if current_group:
-                packs.append(current_group)
-            if return_seqs:
-                current_group = [item]
-            else:
-                current_group = [item[0]]
-            current_len = item_len
-    if current_group:
-        packs.append(current_group)
-    return packs
+                if current_group:
+                    packs.append(current_group)
+                if return_seqs:
+                    current_group = [item]
+                else:
+                    current_group = [item[0]]
+                current_len = item_len
+        if current_group:
+            packs.append(current_group)
+        return packs

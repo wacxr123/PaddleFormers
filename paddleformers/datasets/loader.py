@@ -31,13 +31,13 @@ def create_dataset(**dataset_config: Dict[str, Any]):
     """
     DATASET_CLASSES = {
         ("dpo", "map"): MapDPODataset,
-        ("dpo", "iterator"): IteratorDPODataset,
+        ("dpo", "iterable"): IteratorDPODataset,
         ("sft", "map"): MapSFTDataset,
-        ("sft", "iterator"): IteratorSFTDataset,
+        ("sft", "iterable"): IteratorSFTDataset,
     }
 
     stage = "dpo" if dataset_config["stage"].lower() in ["dpo", "vl-dpo"] else "sft"
-    dataset_type = dataset_config.get("dataset_type", "iterator").lower()
+    dataset_type = dataset_config.get("dataset_type", "iterable").lower()
     dataset_cls = DATASET_CLASSES[(stage, dataset_type)]
 
     return dataset_cls(**dataset_config)
