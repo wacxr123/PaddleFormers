@@ -450,6 +450,8 @@ def run_sft(
         "template": data_args.template,
         "tool_format": None,
         "default_system": None,
+        "packed_idx_cache_dir": data_args.packed_idx_cache_dir,
+        "split": None,
     }
 
     if dataset_config["template_backend"] == "custom":
@@ -586,6 +588,8 @@ def run_sft(
             eval_dataset = create_indexed_dataset(data_file_prefix=eval_file_path)
     else:
         if training_args.should_load_dataset:
+            # add a train/eval teller in dataset_config
+            dataset_config["split"] = "train"
             train_dataset = create_dataset_sft(
                 task_group=data_args.train_dataset_path,
                 task_group_prob=data_args.train_dataset_prob,
@@ -593,6 +597,7 @@ def run_sft(
                 **dataset_config,
             )
         if training_args.do_eval and training_args.should_load_dataset:
+            dataset_config["split"] = "eval"
             eval_dataset = create_dataset_sft(
                 task_group=data_args.eval_dataset_path,
                 task_group_prob=data_args.eval_dataset_prob,
@@ -600,6 +605,7 @@ def run_sft(
                 is_valid=True,
                 **dataset_config,
             )
+        dataset_config.pop("split")
 
     # Freeze model based on training args (Supports for MLLM Full training)
     if not model_args.lora and getattr(training_args, "freeze_config", ""):

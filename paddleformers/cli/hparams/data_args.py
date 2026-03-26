@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -174,4 +175,14 @@ class DataArguments:
     truncation_strategy: str = field(
         default="right",
         metadata={"help": "Truncation strategy for packing."},
+    )
+    packed_idx_cache_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Directory to cache packed_idx built by MapSFTDataset. "
+                "When set, saves/reloads packed_idx to skip re-tokenization on restart. "
+                "Default is None (no caching)."
+            )
+        },
     )
