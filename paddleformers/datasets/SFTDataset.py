@@ -93,7 +93,7 @@ class BaseSFTDataset:
         self.greedy_intokens = dataset_config.get("greedy_intokens", True)
         self.dtype = dataset_config.get("dtype", None)
         self.binpacking = dataset_config.get("binpacking", False)
-        self.packing_interval = dataset_config.get("packing_interval", 1000)
+        self.packing_interval = dataset_config.get("packing_interval", 128)
         if self.is_pretraining and self.packing and self.truncate_packing:
             logger.info("[dataflow] pretrain dataflow using truncate packing.")
 
@@ -351,13 +351,13 @@ class BaseSFTDataset:
             return "greedy"
         return "sequential"
 
-    def _pack_items(self, items, return_seqs=False):
+    def _pack_items(self, items, is_finished, return_seqs=False):
         """Unified packing logic using pack_by_length."""
         return pack_by_length(
             items=items,
             max_seq_len=self.max_seq_len,
             packing_mode=self._get_packing_mode(),
-            packing_interval=self.packing_interval,
+            is_finished=is_finished,
             return_seqs=return_seqs,
         )
 
@@ -494,7 +494,9 @@ class BaseSFTDataset:
                         accumulated_data += batch_sequences
 
                         # Use unified _pack_items
-                        packed = self._pack_items(accumulated_data, return_seqs=True)
+                        packed, accumulated_data = self._pack_items(
+                            accumulated_data, is_finished=finished, return_seqs=True
+                        )
 
                         for pack in packed:
                             if len(pack) > 0:

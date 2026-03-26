@@ -169,7 +169,7 @@ class DataArguments:
         metadata={"help": "Whether to use bin packing."},
     )
     packing_interval: int = field(
-        default=1000,
+        default=128,
         metadata={"help": "Interval of packing."},
     )
     truncation_strategy: str = field(
