@@ -94,6 +94,7 @@ class BaseSFTDataset:
         self.dtype = dataset_config.get("dtype", None)
         self.binpacking = dataset_config.get("binpacking", False)
         self.packing_interval = dataset_config.get("packing_interval", 128)
+        self.packing_batch_size = dataset_config.get("packing_batch_size", 1000)
         if self.is_pretraining and self.packing and self.truncate_packing:
             logger.info("[dataflow] pretrain dataflow using truncate packing.")
 
@@ -351,13 +352,14 @@ class BaseSFTDataset:
             return "greedy"
         return "sequential"
 
-    def _pack_items(self, items, is_finished, return_seqs=False):
+    def _pack_items(self, items, is_finished=True, return_seqs=False):
         """Unified packing logic using pack_by_length."""
         return pack_by_length(
             items=items,
             max_seq_len=self.max_seq_len,
             packing_mode=self._get_packing_mode(),
             is_finished=is_finished,
+            packing_batch_size=self.packing_batch_size,
             return_seqs=return_seqs,
         )
 
@@ -1026,8 +1028,7 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
 
         logger.info(f"[MapSFTDataset] Valid samples: {len(idx_len_pairs)} / {len(self.raw_data)}")
 
-        # Use unified _pack_items
-        self.packed_idx = self._pack_items(idx_len_pairs, return_seqs=False)
+        self.packed_idx = self._pack_items(idx_len_pairs, is_finished=True, return_seqs=False)
 
         logger.info(f"[MapSFTDataset] packing=True, total packs: {len(self.packed_idx)}")
 
@@ -1059,6 +1060,7 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
             "binpacking": str(self.binpacking),
             "greedy_intokens": str(self.greedy_intokens),
             "packing_interval": str(self.packing_interval),
+            "packing_batch_size": str(self.packing_batch_size),
         }
         key_str = json.dumps(key_dict, sort_keys=True, ensure_ascii=True)
         return hashlib.sha256(key_str.encode("utf-8")).hexdigest()[:16]
