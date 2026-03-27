@@ -451,6 +451,7 @@ def run_sft(
         "dataset_num_proc": finetuning_args.dataset_num_proc,
         "binpacking": data_args.binpacking,
         "packing_interval": data_args.packing_interval,
+        "packing_batch_size": data_args.packing_batch_size,
         "dataloader_num_workers": training_args.dataloader_num_workers,
         "template": data_args.template,
         "tool_format": None,
