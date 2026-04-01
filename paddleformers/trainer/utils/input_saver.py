@@ -62,7 +62,7 @@ class InputSaver:
         """Convert tensor/array to numpy array."""
         if value is None:
             return None
-        print(value.dtype)
+        # print(value.dtype) # Optional
         if hasattr(value, "dtype") and value.dtype == paddle.bfloat16:
             value = paddle.cast(value, "float32")
         if hasattr(value, "cpu"):
