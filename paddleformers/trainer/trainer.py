@@ -94,7 +94,7 @@ from paddle.distributed.fleet.utils.hybrid_parallel_util import (
 from paddle.distributed.fleet.utils.sequence_parallel_utils import (
     register_sequence_parallel_allreduce_hooks,
 )
-from paddle.io import DataLoader, Dataset, DistributedBatchSampler
+from paddle.io import DataLoader, Dataset
 from tqdm.auto import tqdm
 
 from ..data import (
@@ -137,7 +137,7 @@ from ..transformers.segment_parallel_utils import (
     split_inputs_sequence_dim,
 )
 from ..utils import empty_device_cache, perf_utils
-from ..utils.batch_sampler import DistributedBatchSampler as NlpDistributedBatchSampler
+from ..utils.batch_sampler import DistributedBatchSampler
 from ..utils.download import resolve_file_path
 from ..utils.env import (
     EMA_STATE_DIC,
@@ -1915,7 +1915,7 @@ class Trainer:
                     steps_trained_progress_bar.set_description("Skipping the first batches")
             if not args.ignore_data_skip:
                 if isinstance(train_dataloader, paddle.io.DataLoader) and isinstance(
-                    train_dataloader.batch_sampler, NlpDistributedBatchSampler
+                    train_dataloader.batch_sampler, DistributedBatchSampler
                 ):
                     consumed_samples = (
                         self.state.global_step
@@ -2007,7 +2007,7 @@ class Trainer:
                     dataloader = train_dataloader._dataloader
 
                 if isinstance(dataloader, paddle.io.DataLoader) and isinstance(
-                    dataloader.batch_sampler, NlpDistributedBatchSampler
+                    dataloader.batch_sampler, DistributedBatchSampler
                 ):
                     if step == 0:
                         if steps_trained_progress_bar is not None:
@@ -4644,7 +4644,7 @@ class Trainer:
             # on eval limit steps
             num_samples = batch_size * self.args.dataset_world_size * max_eval_iters
             if isinstance(dataloader, _DataLoaderIterBase) and isinstance(
-                dataloader._batch_sampler, NlpDistributedBatchSampler
+                dataloader._batch_sampler, DistributedBatchSampler
             ):
                 consumed_samples = (
                     ((self.state.global_step) // args.eval_steps)

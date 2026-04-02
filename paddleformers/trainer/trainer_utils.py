@@ -54,6 +54,7 @@ from paddle.distributed.flex_checkpoint.dcp.sharded_weight import (
 )
 from paddle.io import IterableDataset
 from paddle.optimizer.lr import LambdaDecay
+from paddleformers.utils.batch_sampler import DistributedBatchSampler
 from transformers.tokenization_utils_base import BatchEncoding
 
 # from ..ops import Topology
@@ -1229,7 +1230,7 @@ class IterableDatasetShard(IterableDataset):
             return math.ceil(len(self.dataset) / (self.batch_size * self.num_processes)) * self.batch_size
 
 
-class LastBatchPaddingSampler(paddle.io.DistributedBatchSampler):
+class LastBatchPaddingSampler(DistributedBatchSampler):
     """The sampler which pads the first batch to the last batch"""
 
     def __iter__(self):

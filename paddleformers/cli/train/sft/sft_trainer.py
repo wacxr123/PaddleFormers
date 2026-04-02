@@ -33,7 +33,8 @@ import paddle.distributed as dist
 import paddle.nn as nn
 from datasets import Dataset
 from paddle.distributed import fleet
-from paddle.io import BatchSampler, DataLoader, DistributedBatchSampler
+from paddle.io import BatchSampler, DataLoader
+from paddleformers.utils.batch_sampler import DistributedBatchSampler
 
 if TYPE_CHECKING:
     try:
