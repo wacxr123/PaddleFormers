@@ -173,12 +173,8 @@ class DataArguments:
         metadata={"help": "Whether to use bin packing."},
     )
     packing_interval: int = field(
-        default=128,
-        metadata={"help": "Number of items to accumulate before packing in streaming mode."},
-    )
-    packing_batch_size: int = field(
         default=1000,
-        metadata={"help": "Batch size for binpacking in non-streaming (index) mode."},
+        metadata={"help": "Number of items to accumulate before packing in streaming mode."},
     )
     truncation_strategy: str = field(
         default="right",
