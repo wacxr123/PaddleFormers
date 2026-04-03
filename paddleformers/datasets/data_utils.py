@@ -318,6 +318,7 @@ def get_worker_sliced_iterator(dataset):
     Returns:
         Iterator: An iterator yielding data specific to the current worker.
     """
+
     # 1. Get the full original iterator
     # Ensure the input is converted to an iterator so islice works correctly
     def infinite_iterator(iterable):
@@ -358,36 +359,23 @@ def pack_by_length(
     max_seq_len,
     packing_mode="sequential",
     is_finished=True,
-    packing_batch_size=None,
+    packing_interval=1000,
     return_seqs=False,
 ):
     """Group items into packs that fit within max_seq_len.
-
-    Supports three packing strategies:
-    - "binpacking": optimal bin-packing via `calculate_matched_group`
-    - "greedy": greedy best-fit using argmax on remaining capacity
-    - "sequential" (default): left-to-right greedy sequential packing
-
-    Supports two input modes:
-    - Index mode (default): items = [(idx, length), ...], length is pair[1]
-    - Object mode (return_seqs=True): items = [obj, obj, ...], use len(item.token_ids)
-
     Args:
         items: List of items to pack. Can be [(idx, length), ...] or [obj, ...].
         max_seq_len: Maximum total token length per pack.
         packing_mode: Packing strategy - "sequential", "binpacking", or "greedy".
         is_finished: Whether all items have been provided (affects binpacking accumulation).
-        packing_batch_size: Chunk size for binpacking batching. When set, items are
-            chunked and accumulated in batches for binpacking to control memory usage.
-            Only used when packing_mode="binpacking".
+        packing_interval: Only used when packing_mode="binpacking".
         return_seqs: If False, return indices (pair[0]). If True, return full items.
 
     Returns:
-        When packing_mode="binpacking" and return_seqs=True:
+        packing_mode="binpacking" and return_seqs=True:
             (packed_groups, accumulated_data) tuple.
         Otherwise:
             List[List[int]] (return_seqs=False) or List[List[item]] (return_seqs=True):
-            Groups of indices or items, each group fitting within max_seq_len.
     """
     if not items:
         return ([], []) if (return_seqs and packing_mode == "binpacking") else []
@@ -406,10 +394,10 @@ def pack_by_length(
         # Chunked binpacking: accumulate across chunks
         all_packed = []
         accumulated = []
-        for i in range(0, len(items), packing_batch_size):
-            chunk = items[i : i + packing_batch_size]
+        for i in range(0, len(items), packing_interval):
+            chunk = items[i : i + packing_interval]
             accumulated += chunk
-            finished = (i + packing_batch_size >= len(items)) and is_finished
+            finished = (i + packing_interval >= len(items)) and is_finished
             packed, accumulated = calculate_matched_group(accumulated, max_seq_len, is_finished=finished)
             all_packed += packed
         # Flush remaining
@@ -446,8 +434,7 @@ def pack_by_length(
                 packs.append([])
         return packs
 
-    # Default: sequential greedy packing
-    else:
+    else:  # Default: sequential greedy packing
         logger.info("Using sequential packing mode for data iteration.")
         packs = []
         current_group = []

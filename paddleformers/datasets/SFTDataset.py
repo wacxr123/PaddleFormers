@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import datetime
-import hashlib
-import json
 import multiprocessing as mp
 import os
 import time
@@ -93,8 +90,7 @@ class BaseSFTDataset:
         self.greedy_intokens = dataset_config.get("greedy_intokens", True)
         self.dtype = dataset_config.get("dtype", None)
         self.binpacking = dataset_config.get("binpacking", False)
-        self.packing_interval = dataset_config.get("packing_interval", 128)
-        self.packing_batch_size = dataset_config.get("packing_batch_size", 1000)
+        self.packing_interval = dataset_config.get("packing_interval", 1000)
         if self.is_pretraining and self.packing and self.truncate_packing:
             logger.info("[dataflow] pretrain dataflow using truncate packing.")
 
@@ -218,16 +214,18 @@ class BaseSFTDataset:
             except Exception:
                 break
 
-    def _get_processed_data_iterator(self, dataset_iterator, actual_example_num, processor_func):
+    def _get_processed_data_iterator(self, dataset_iterator, actual_example_num, processor_func, skip_none=True):
         """Get an iterator that yields processed data, using multiprocessing if enabled.
 
         Args:
             dataset_iterator: Raw data iterator.
             actual_example_num: Number of examples used.
             processor_func: Function to process each example.
+            skip_none: If True (default), skip None results. If False, yield None so
+                that enumerate indices stay aligned with the original data order.
 
         Yields:
-            Processed results in order (skips None results).
+            Processed results in order.
         """
 
         def _rss_mb():
@@ -299,6 +297,8 @@ class BaseSFTDataset:
                                 )
                             yield res
                         else:
+                            if not skip_none:
+                                yield None
                             if self.estimate:
                                 self.used_estimate_samples += actual_example_num
                                 self.unused_samples += actual_example_num
@@ -320,6 +320,8 @@ class BaseSFTDataset:
                         print(f"[MemDebug][single] yielded={_yield_cnt}, RSS={_rss_mb():.0f} MB")
                     yield result
                 else:
+                    if not skip_none:
+                        yield None
                     if self.estimate:
                         self.unused_samples += actual_example_num
                         self.used_estimate_samples += actual_example_num
@@ -359,7 +361,7 @@ class BaseSFTDataset:
             max_seq_len=self.max_seq_len,
             packing_mode=self._get_packing_mode(),
             is_finished=is_finished,
-            packing_batch_size=self.packing_batch_size,
+            packing_interval=self.packing_interval,
             return_seqs=return_seqs,
         )
 
@@ -918,7 +920,7 @@ class IteratorSFTDataset(BaseSFTDataset, IterableDataset):
 class MapSFTDataset(BaseSFTDataset, Dataset):
     @staticmethod
     def _serialize_packed_idx(packed_idx: List[List[int]]):
-        """Serialize packed_idx to CSR format (data + offsets arrays)."""
+        """Serialize packed_idx to data + offsets arrays."""
         offsets = np.zeros(len(packed_idx) + 1, dtype=np.int32)
         for i, pack in enumerate(packed_idx):
             offsets[i + 1] = offsets[i] + len(pack)
@@ -938,38 +940,26 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
     def __init__(self, **dataset_config):
         super().__init__(**dataset_config)
 
-        self._dataset_config = dataset_config  # preserved for cache key
         self.packed_idx_cache_dir: Optional[str] = dataset_config.get("packed_idx_cache_dir", None)
+        self.traceback_limit = 10
+        self._traceback_counter = 0
 
-        # Always store raw data for index-based access
         self.raw_data = list(self.mix_datasets)
 
         if self.packing:
-            # Use length-only processor for packing index building
             self._current_processor_func = self._process_sequence_length
             self._build_packed_idx()
         else:
             logger.info(f"[MapSFTDataset] packing=False, total samples: {len(self.raw_data)}")
             self.n_try_fetch = min(10, len(self.raw_data))
             self.random_state = np.random.RandomState(None)
-            self.traceback_limit = 10
-            self._traceback_counter = 0
             self._idx = 0
             self._idx_list = self.random_state.permutation(len(self.raw_data)).tolist()
 
     def _build_packed_idx(self):
-        """First pass: tokenize all samples once to get lengths, then pack into index lists.
+        """tokenize all samples once to get lengths, then pack into index lists.
+        Stores only packed_idx (List[List[int]]) instead of full token tensors"""
 
-        Supports multiprocessing via dataset_num_proc for the tokenization pass.
-        Uses pack_by_length for grouping, supporting binpacking, greedy_intokens,
-        and sequential packing strategies.
-
-        Stores only packed_idx (List[List[int]]) instead of full token tensors,
-        reducing memory from O(N * seq_len tokens) to O(N * seq_len chars).
-        """
-        from tqdm import tqdm
-
-        # Try loading from cache first
         if self.packed_idx_cache_dir is not None:
             cached = self._load_packed_idx_cache()
             if cached is not None:
@@ -979,52 +969,14 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
         logger.info("[MapSFTDataset] packing=True, building packed index (lazy storage)...")
         actual_example_num = 1
 
-        # Collect (raw_data_idx, token_length) for valid samples, skip invalid ones
         idx_len_pairs = []  # [(raw_idx, token_len), ...]
-
-        if self.dataset_num_proc > 1:
-            # Multiprocessing path: reuse existing worker pool infrastructure
-            self._ensure_workers()
-            pending, send_idx, recv_idx = 0, 0, 0
-            result_buffer = {}
-            total = len(self.raw_data)
-
-            # Pre-fill the queue
-            for _ in range(min(self.prefetch_size, total)):
-                self._in_queue.put((send_idx, self.raw_data[send_idx], actual_example_num))
-                send_idx += 1
-                pending += 1
-
-            with tqdm(total=total, desc="[MapSFTDataset] Tokenizing for lengths") as pbar:
-                while pending > 0:
-                    idx, result = self._out_queue.get()
-                    pending -= 1
-                    pbar.update(1)
-
-                    # Refill the queue
-                    while send_idx < total and pending < self.prefetch_size:
-                        self._in_queue.put((send_idx, self.raw_data[send_idx], actual_example_num))
-                        send_idx += 1
-                        pending += 1
-
-                    # Buffer results for in-order processing
-                    result_buffer[idx] = result
-
-                    # Yield results in order
-                    while recv_idx in result_buffer:
-                        res = result_buffer.pop(recv_idx)
-                        if res is not None:
-                            idx_len_pairs.append((recv_idx, res))
-                        recv_idx += 1
-        else:
-            # Single-threaded path
-            for raw_idx, example in enumerate(tqdm(self.raw_data, desc="[MapSFTDataset] Tokenizing for lengths")):
-                try:
-                    length = self._process_sequence_length(example, actual_example_num)
-                    if length is not None:
-                        idx_len_pairs.append((raw_idx, length))
-                except Exception as e:
-                    logger.warning(f"[MapSFTDataset] Skipping example {raw_idx}: {e}")
+        dataset_iterator = iter(self.raw_data)
+        data_iter = self._get_processed_data_iterator(
+            dataset_iterator, actual_example_num, self._process_sequence_length, skip_none=False
+        )
+        for raw_idx, length in enumerate(data_iter):
+            if length is not None:
+                idx_len_pairs.append((raw_idx, length))
 
         logger.info(f"[MapSFTDataset] Valid samples: {len(idx_len_pairs)} / {len(self.raw_data)}")
 
@@ -1032,44 +984,12 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
 
         logger.info(f"[MapSFTDataset] packing=True, total packs: {len(self.packed_idx)}")
 
-        # Save cache after successful build
         if self.packed_idx_cache_dir is not None:
             self._save_packed_idx_cache()
 
-    def _compute_cache_key(self) -> str:
-        """Compute a 16-char SHA-256 digest of all parameters that affect packed_idx."""
-        cfg = self._dataset_config
-        tokenizer_id = getattr(self.tokenizer, "name_or_path", None) or type(self.tokenizer).__name__
-        template_id = type(self.template).__name__ if self.template else "NoTemplate"
-        key_dict = {
-            "split": str(cfg.get("split", "")),
-            "task_group": str(cfg.get("task_group", "")),
-            "task_group_prob": str(cfg.get("task_group_prob", "")),
-            "sub_dataset_type": str(cfg.get("sub_dataset_type", "")),
-            "random_seed": str(cfg.get("random_seed", 0)),
-            "random_shuffle": str(cfg.get("random_shuffle", True)),
-            "num_samples_each_epoch": str(cfg.get("num_samples_each_epoch", 0)),
-            "max_seq_len": str(self.max_seq_len),
-            "tokenizer": tokenizer_id,
-            "template": template_id,
-            "template_backend": self.template_backend,
-            "use_template": str(self.use_template),
-            "split_multi_turn": str(self.split_multi_turn),
-            "encode_one_turn": str(self.encode_one_turn),
-            "is_pretraining": str(self.is_pretraining),
-            "binpacking": str(self.binpacking),
-            "greedy_intokens": str(self.greedy_intokens),
-            "packing_interval": str(self.packing_interval),
-            "packing_batch_size": str(self.packing_batch_size),
-        }
-        key_str = json.dumps(key_dict, sort_keys=True, ensure_ascii=True)
-        return hashlib.sha256(key_str.encode("utf-8")).hexdigest()[:16]
-
     def _save_packed_idx_cache(self) -> None:
-        """Serialize packed_idx to .npz and write .meta.json atomically."""
-        cache_key = self._compute_cache_key()
-        data_path = os.path.join(self.packed_idx_cache_dir, f"packed_idx_{cache_key}")
-        meta_path = os.path.join(self.packed_idx_cache_dir, f"packed_idx_{cache_key}.meta.json")
+        """Serialize packed_idx to .npz"""
+        data_path = os.path.join(self.packed_idx_cache_dir, "packed_idx")
 
         try:
             os.makedirs(self.packed_idx_cache_dir, exist_ok=True)
@@ -1077,45 +997,25 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
             data_arr, offsets_arr = self._serialize_packed_idx(self.packed_idx)
             np.savez_compressed(data_path, data=data_arr, offsets=offsets_arr)
 
-            meta = {
-                "hash": cache_key,
-                "created_at": datetime.datetime.now().astimezone().isoformat(),
-                "num_packs": len(self.packed_idx),
-                "num_samples": sum(len(p) for p in self.packed_idx),
-                "max_seq_len": self.max_seq_len,
-                "packing_mode": self._get_packing_mode(),
-            }
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
-
             logger.info(f"[MapSFTDataset] Saved packed_idx cache to {data_path}")
         except Exception as e:
             logger.warning(f"[MapSFTDataset] Failed to save packed_idx cache: {e}")
-            for p in [data_path, meta_path]:
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
+            if os.path.exists(data_path):
+                try:
+                    os.remove(data_path)
+                except OSError:
+                    pass
 
     def _load_packed_idx_cache(self) -> Optional[List[List[int]]]:
         """Try to load packed_idx from cache. Returns None on any miss or error (silent fallback)."""
-        cache_key = self._compute_cache_key()
-        data_path = os.path.join(self.packed_idx_cache_dir, f"packed_idx_{cache_key}.npz")
-        meta_path = os.path.join(self.packed_idx_cache_dir, f"packed_idx_{cache_key}.meta.json")
 
-        if not os.path.exists(data_path) or not os.path.exists(meta_path):
+        data_path = os.path.join(self.packed_idx_cache_dir, "packed_idx.npz")
+
+        if not os.path.exists(data_path):
             logger.info("[MapSFTDataset] packed_idx cache not found, will build from scratch.")
             return None
 
         try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-
-            if meta.get("hash") != cache_key:
-                logger.warning("[MapSFTDataset] Cache hash mismatch, ignoring cache.")
-                return None
-
             npz = np.load(data_path)
             packed_idx = self._deserialize_packed_idx(npz["data"], npz["offsets"])
             logger.info(
@@ -1150,37 +1050,25 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
         actual_example_num = 1
 
         for i in range(self.n_try_fetch):
-            if i == 0:
-                current_idx = idx
-            else:
-                current_idx = self._idx_list[self._idx]
+            current_idx = idx if i == 0 else self._idx_list[self._idx]
+            if i > 0:
                 self._idx = (self._idx + 1) % len(self.raw_data)
 
-            example = self.raw_data[current_idx]
             try:
-                sequence = self._process_sequence(example, actual_example_num)
-
+                sequence = self._process_sequence(self.raw_data[current_idx], actual_example_num)
                 if sequence is not None:
                     return [sequence]
-
-                # sequence is None, try next
-                if self.traceback_limit is not None and self._traceback_counter < self.traceback_limit:
-                    logger.warning(
-                        f"[MapSFTDataset] Example at index {current_idx} returned None, "
-                        "another piece of data will be randomly selected."
-                    )
-                    self._traceback_counter += 1
-
             except Exception:
-                if self.traceback_limit is not None and self._traceback_counter < self.traceback_limit:
-                    import traceback
+                import traceback
 
-                    logger.info(traceback.format_exc())
-                    logger.warning(
-                        "[MapSFTDataset] There are errors in data processing, "
-                        "another piece of data will be randomly selected."
-                    )
-                    self._traceback_counter += 1
+                logger.info(traceback.format_exc())
+
+            if self._traceback_counter < self.traceback_limit:
+                logger.warning(
+                    f"[MapSFTDataset] Example at index {current_idx} failed or returned None, "
+                    "another piece of data will be randomly selected."
+                )
+                self._traceback_counter += 1
 
         raise ValueError(
             f"[MapSFTDataset] Failed to retrieve valid data after {self.n_try_fetch} attempts. "
