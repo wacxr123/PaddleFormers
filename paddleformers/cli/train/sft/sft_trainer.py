@@ -33,7 +33,8 @@ import paddle.distributed as dist
 import paddle.nn as nn
 from datasets import Dataset
 from paddle.distributed import fleet
-from paddle.io import BatchSampler, DataLoader
+from paddle.io import DataLoader
+
 from paddleformers.utils.batch_sampler import DistributedBatchSampler
 
 if TYPE_CHECKING:
@@ -386,15 +387,17 @@ class SFTTrainer(Trainer):
 
     def get_ptq_dataloader(self, ptq_ds):
         if self.args.world_size <= 1:
-            ptq_sampler = BatchSampler(
-                dataset=ptq_ds,
-                shuffle=True,
+            ptq_sampler = DistributedBatchSampler(
+                ptq_ds,
                 batch_size=self.args.per_device_train_batch_size,
+                num_replicas=1,
+                rank=0,
+                shuffle=True,
                 drop_last=self.args.dataloader_drop_last,
             )
         else:
             ptq_sampler = DistributedBatchSampler(
-                self.train_dataset,
+                ptq_ds,
                 batch_size=self.args.per_device_train_batch_size,
                 shuffle=True,
                 num_replicas=self.args.dataset_world_size,

@@ -1876,6 +1876,7 @@ class Trainer:
         epochs_trained = 0
         steps_trained_in_current_epoch = 0
         steps_trained_progress_bar = None
+        _resume_consumed_samples = 0
 
         # Check if continuing training from a checkpoint
         if (
@@ -1916,17 +1917,16 @@ class Trainer:
                     steps_trained_progress_bar = tqdm(total=steps_trained_in_current_epoch)
                     steps_trained_progress_bar.set_description("Skipping the first batches")
             if not args.ignore_data_skip:
+                _resume_consumed_samples = 0
                 if isinstance(train_dataloader, paddle.io.DataLoader) and isinstance(
                     train_dataloader.batch_sampler, DistributedBatchSampler
                 ):
-                    consumed_samples = (
-                        self.state.global_step
-                        * args.train_batch_size
-                        * args.gradient_accumulation_steps
-                        * args.dataset_world_size
+                    _resume_consumed_samples = (
+                        steps_trained_in_current_epoch * args.train_batch_size * args.dataset_world_size
                     )
-                    train_dataloader.batch_sampler.set_epoch(consumed_samples=consumed_samples)
-                    logger.info(f"Set DistributedBatchSampler consumed_samples to {consumed_samples}")
+                    logger.info(
+                        f"Will resume with consumed_samples={_resume_consumed_samples} " f"for epoch {epochs_trained}"
+                    )
 
         epoch_iterator = train_dataloader
         # Use len_dataloader directly instead of len(epoch_iterator) to avoid
@@ -1975,7 +1975,8 @@ class Trainer:
                 and isinstance(train_dataloader, paddle.io.DataLoader)
                 and isinstance(train_dataloader.batch_sampler, DistributedBatchSampler)
             ):
-                train_dataloader.batch_sampler.set_epoch(epoch)
+                train_dataloader.batch_sampler.set_epoch(epoch, consumed_samples=_resume_consumed_samples)
+            _resume_consumed_samples = 0
 
             step_control = 0  # used in loop control, reset to 0 after every step
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
@@ -2333,6 +2334,7 @@ class Trainer:
                 self.control.should_training_stop = True
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
+            steps_trained_in_current_epoch = 0
 
             if self.args.enable_auto_parallel:
                 with _exec_mode_guard("dynamic"):
@@ -2463,7 +2465,7 @@ class Trainer:
         if self.args.enable_auto_parallel:
             total_batch_size = total_batch_size * self.args.dataset_world_size
 
-        if self.args.enable_auto_parallel or self.args.world_size <= 1:
+        if self.args.enable_auto_parallel:
             batch_sampler = paddle.io.BatchSampler(
                 dataset=self.train_dataset,
                 shuffle=shuffle,
@@ -2473,9 +2475,18 @@ class Trainer:
             # Set _acc_steps for auto_parallel mode to ensure correct __len__ calculation
             # When _acc_steps = gradient_accumulation_steps, the dataloader length will be
             # the number of optimizer steps, not micro-batches
-            if self.args.enable_auto_parallel:
-                batch_sampler._acc_steps = self.args.gradient_accumulation_steps
+            batch_sampler._acc_steps = self.args.gradient_accumulation_steps
             return batch_sampler
+
+        if self.args.world_size <= 1:
+            return DistributedBatchSampler(
+                self.train_dataset,
+                batch_size=total_batch_size,
+                num_replicas=1,
+                rank=0,
+                shuffle=shuffle,
+                drop_last=self.args.dataloader_drop_last,
+            )
 
         return DistributedBatchSampler(
             self.train_dataset,
@@ -2818,9 +2829,11 @@ class Trainer:
         if eval_dataset is None or not has_length(eval_dataset):
             return None
         if self.args.world_size <= 1:
-            return paddle.io.BatchSampler(
+            return DistributedBatchSampler(
                 eval_dataset,
                 batch_size=self.args.per_device_eval_batch_size,
+                num_replicas=1,
+                rank=0,
                 shuffle=False,
                 drop_last=False,
             )
