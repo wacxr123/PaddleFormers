@@ -2486,6 +2486,7 @@ class Trainer:
                 rank=0,
                 shuffle=shuffle,
                 drop_last=self.args.dataloader_drop_last,
+                data_seed=self.args.seed,
             )
 
         return DistributedBatchSampler(
@@ -2495,6 +2496,7 @@ class Trainer:
             num_replicas=self.args.dataset_world_size,
             rank=self.args.dataset_rank,
             drop_last=self.args.dataloader_drop_last,
+            data_seed=self.args.seed,
         )
 
     def _set_state_dict_in_model(self, state_dict):
@@ -2836,6 +2838,7 @@ class Trainer:
                 rank=0,
                 shuffle=False,
                 drop_last=False,
+                data_seed=self.args.seed,
             )
         else:
             if (
@@ -2861,6 +2864,7 @@ class Trainer:
                     batch_size=self.args.per_device_eval_batch_size,
                     shuffle=False,
                     drop_last=False,
+                    data_seed=self.args.seed,
                 )
 
     def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
