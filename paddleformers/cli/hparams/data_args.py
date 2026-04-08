@@ -140,6 +140,10 @@ class DataArguments:
         metadata={"help": "Whether to skip the warmup process of mmap files."},
     )
     data_cache: str = field(default=None, metadata={"help": "The path of the cached dataset."})
+    truncation_strategy: str = field(
+        default="delete",
+        metadata={"help": "The truncation strategy to use in data processing."},
+    )
     truncate_packing: bool = field(
         default=True,
         metadata={"help": "Whether to truncate data in packing (only valid in pretrain online dataflow)."},
@@ -171,10 +175,6 @@ class DataArguments:
     packing_interval: int = field(
         default=1000,
         metadata={"help": "Number of items to accumulate before packing in streaming mode."},
-    )
-    truncation_strategy: str = field(
-        default="right",
-        metadata={"help": "Truncation strategy for packing."},
     )
     packed_idx_cache_dir: Optional[str] = field(
         default=None,
