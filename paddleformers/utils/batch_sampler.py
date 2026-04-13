@@ -14,9 +14,6 @@
 
 from __future__ import division, print_function
 
-import math
-
-import numpy as np
 import paddle
 
 __all__ = ["MappingBatchSampler", "MappingDistributedBatchSampler", "DistributedBatchSampler"]
@@ -32,19 +29,10 @@ class RandomSamplerWithSeed(paddle.io.RandomSampler):
 
     def __iter__(self):
         n = len(self.data_source)
-        num_samples = self.num_samples if self.num_samples is not None else n
-        if self.generator:
-            for i in range(num_samples):
-                try:
-                    index = next(self.generator)
-                except StopIteration:
-                    return
-                yield index
-        else:
-            for index in (
-                np.random.RandomState(self.epoch).choice(np.arange(n), num_samples, replace=self.replacement).tolist()
-            ):
-                yield index
+        # Aligned with ms-swift: use paddle.seed + paddle.randperm
+        paddle.seed(self.epoch)
+        for index in paddle.randperm(n).tolist():
+            yield index
 
 
 class MappingBatchSampler(paddle.io.BatchSampler):
@@ -90,52 +78,24 @@ class MappingDistributedBatchSampler(paddle.io.DistributedBatchSampler):
             dataset, batch_size, num_replicas=num_replicas, rank=rank, shuffle=shuffle, drop_last=drop_last
         )
         self.consumed_samples = consumed_samples
+        # Floor truncate instead of ceil padding (aligned with ms-swift BatchSamplerShard)
+        self.num_samples = len(self.dataset) // self.nranks
+        self.total_size = self.num_samples * self.nranks
 
     def set_epoch(self, epoch=0, consumed_samples=0):
         self.epoch = epoch
         self.consumed_samples = consumed_samples
 
     def __iter__(self):
-        num_samples = len(self.dataset)
-        indices = np.arange(num_samples).tolist()
-
-        # Add extra samples to make it evenly divisible
-        padding_size = self.total_size - len(indices)
-        if padding_size <= len(indices):
-            indices += indices[:padding_size]
-        else:
-            indices += (indices * math.ceil(padding_size / len(indices)))[:padding_size]
-
-        assert len(indices) == self.total_size
-
         if self.shuffle:
-            np.random.RandomState(self.epoch).shuffle(indices)
-            self.epoch += 1
-
-        # Subsample for local rank
-        def _get_indices_by_batch_size(indices):
-            subsampled_indices = []
-            last_batch_size = self.total_size % (self.batch_size * self.nranks)
-            assert last_batch_size % self.nranks == 0
-            last_local_batch_size = last_batch_size // self.nranks
-
-            for i in range(
-                self.local_rank * self.batch_size,
-                len(indices) - last_batch_size,
-                self.batch_size * self.nranks,
-            ):
-                subsampled_indices.extend(indices[i : i + self.batch_size])
-
-            indices = indices[len(indices) - last_batch_size :]
-            subsampled_indices.extend(
-                indices[self.local_rank * last_local_batch_size : (self.local_rank + 1) * last_local_batch_size]
-            )
-            return subsampled_indices
-
-        if self.nranks > 1:
-            indices = _get_indices_by_batch_size(indices)
-
-        assert len(indices) == self.num_samples
+            # Set global seed and use randperm (aligned with ms-swift BatchSamplerShard)
+            paddle.seed(self.epoch)
+            total_idx = paddle.randperm(self.total_size).tolist()
+            # Interleaved sharding: each rank takes every nranks-th sample
+            total_idx = total_idx[self.local_rank :: self.nranks]
+        else:
+            # Interleaved sharding without shuffle
+            total_idx = list(range(self.local_rank, self.total_size, self.nranks))
 
         assert (
             self.consumed_samples % self.nranks == 0
@@ -146,12 +106,12 @@ class MappingDistributedBatchSampler(paddle.io.DistributedBatchSampler):
 
         # Skip consumed samples for resume (per-rank)
         consumed_per_rank = self.consumed_samples // self.nranks
-        indices = indices[consumed_per_rank:]
+        total_idx = total_idx[consumed_per_rank:]
 
         # Yield in batches
         local_batch_size = self.batch_size * self._acc_steps
         batch_indices = []
-        for idx in indices:
+        for idx in total_idx:
             batch_indices.append(idx)
             if len(batch_indices) == local_batch_size:
                 yield batch_indices
