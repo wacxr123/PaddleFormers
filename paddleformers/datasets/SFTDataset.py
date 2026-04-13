@@ -1152,11 +1152,6 @@ class MapSFTDataset(BaseSFTDataset, Dataset):
                     )
                     self._traceback_counter += 1
 
-        if len(sequences) == 0:
-            raise ValueError(
-                f"[MapSFTDataset] All samples in packed group {idx} failed to process. " "Check your data quality."
-            )
-
         return sequences
 
     def _getitem_single(self, idx):
