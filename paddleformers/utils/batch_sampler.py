@@ -20,8 +20,9 @@ __all__ = ["MappingBatchSampler", "MappingDistributedBatchSampler", "Distributed
 
 
 class RandomSamplerWithSeed(paddle.io.RandomSampler):
-    def __init__(self, data_source, replacement=False, num_samples=None, generator=None) -> None:
+    def __init__(self, data_source, replacement=False, num_samples=None, generator=None, data_seed=None) -> None:
         super().__init__(data_source, replacement=replacement, num_samples=num_samples, generator=generator)
+        self.base_seed = data_seed or 0
         self.epoch = 0
 
     def set_epoch(self, epoch=0):
@@ -29,17 +30,17 @@ class RandomSamplerWithSeed(paddle.io.RandomSampler):
 
     def __iter__(self):
         n = len(self.data_source)
-        # Aligned with ms-swift: use paddle.seed + paddle.randperm
-        paddle.seed(self.epoch)
+        # Aligned with ms-swift: use base_seed + epoch as seed
+        paddle.seed(self.base_seed + self.epoch)
         for index in paddle.randperm(n).tolist():
             yield index
 
 
 class MappingBatchSampler(paddle.io.BatchSampler):
-    def __init__(self, dataset, batch_size, shuffle=False, drop_last=False, consumed_samples=0):
+    def __init__(self, dataset, batch_size, shuffle=False, drop_last=False, consumed_samples=0, data_seed=None):
 
         if shuffle:
-            sampler = RandomSamplerWithSeed(dataset)
+            sampler = RandomSamplerWithSeed(dataset, data_seed=data_seed)
         else:
             sampler = paddle.io.SequenceSampler(dataset)
 
@@ -72,12 +73,21 @@ class MappingBatchSampler(paddle.io.BatchSampler):
 
 class MappingDistributedBatchSampler(paddle.io.DistributedBatchSampler):
     def __init__(
-        self, dataset, batch_size, num_replicas=None, rank=None, shuffle=False, drop_last=False, consumed_samples=0
+        self,
+        dataset,
+        batch_size,
+        num_replicas=None,
+        rank=None,
+        shuffle=False,
+        drop_last=False,
+        consumed_samples=0,
+        data_seed=None,
     ):
         super().__init__(
             dataset, batch_size, num_replicas=num_replicas, rank=rank, shuffle=shuffle, drop_last=drop_last
         )
         self.consumed_samples = consumed_samples
+        self.base_seed = data_seed or 0
         # Floor truncate instead of ceil padding (aligned with ms-swift BatchSamplerShard)
         self.num_samples = len(self.dataset) // self.nranks
         self.total_size = self.num_samples * self.nranks
@@ -89,7 +99,7 @@ class MappingDistributedBatchSampler(paddle.io.DistributedBatchSampler):
     def __iter__(self):
         if self.shuffle:
             # Set global seed and use randperm (aligned with ms-swift BatchSamplerShard)
-            paddle.seed(self.epoch)
+            paddle.seed(self.base_seed + self.epoch)
             total_idx = paddle.randperm(self.total_size).tolist()
             # Interleaved sharding: each rank takes every nranks-th sample
             total_idx = total_idx[self.local_rank :: self.nranks]
