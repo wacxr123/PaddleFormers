@@ -88,9 +88,7 @@ class MappingDistributedBatchSampler(paddle.io.DistributedBatchSampler):
         )
         self.consumed_samples = consumed_samples
         self.base_seed = data_seed or 0
-        # Floor truncate instead of ceil padding (aligned with ms-swift BatchSamplerShard)
-        self.num_samples = len(self.dataset) // self.nranks
-        self.total_size = self.num_samples * self.nranks
+        self.total_size = len(self.dataset) // self.nranks * self.nranks  # floor truncate, no padding
 
     def set_epoch(self, epoch=0, consumed_samples=0):
         self.epoch = epoch
@@ -98,13 +96,10 @@ class MappingDistributedBatchSampler(paddle.io.DistributedBatchSampler):
 
     def __iter__(self):
         if self.shuffle:
-            # Set global seed and use randperm (aligned with ms-swift BatchSamplerShard)
-            paddle.seed(self.base_seed + self.epoch)
+            paddle.seed(self.base_seed + self.epoch)  # global seed, todo
             total_idx = paddle.randperm(self.total_size).tolist()
-            # Interleaved sharding: each rank takes every nranks-th sample
-            total_idx = total_idx[self.local_rank :: self.nranks]
+            total_idx = total_idx[self.local_rank :: self.nranks]  # Interleaved sharding
         else:
-            # Interleaved sharding without shuffle
             total_idx = list(range(self.local_rank, self.total_size, self.nranks))
 
         assert (
